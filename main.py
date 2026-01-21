@@ -145,23 +145,16 @@ def add_text_with_basic_markdown(doc: Document, text: str) -> None:
 
 
 def cleanup_expired_files() -> None:
+    """Borra ficheros DOCX expirados en OUTPUT_DIR para no acumular basura."""
     now = time.time()
-
-    # 1) limpieza del registry
-    to_delete = []
-    for file_id, meta in list(FILE_REGISTRY.items()):
-        created_at = float(meta["created_at"])
-        if now - created_at > DOWNLOAD_TTL_SECONDS:
-            to_delete.append(file_id)
-
-    for file_id in to_delete:
+    for p in glob(os.path.join(OUTPUT_DIR, "*.docx")):
         try:
-            path = str(FILE_REGISTRY[file_id]["path"])
-            if os.path.exists(path):
-                os.remove(path)
+            age = now - os.path.getmtime(p)
+            if age > DOWNLOAD_TTL_SECONDS:
+                os.remove(p)
         except Exception:
             pass
-        FILE_REGISTRY.pop(file_id, None)
+
 
     # 2) limpieza best-effort del disco por mtime (si registry se perdió)
     try:
@@ -302,6 +295,7 @@ def download_document(file_id: str):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=os.path.basename(file_path),
     )
+
 
 
 
