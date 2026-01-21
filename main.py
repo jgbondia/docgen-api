@@ -242,7 +242,13 @@ def resolve_file_path(file_id: str) -> Optional[str]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "api_version": "1.2.0",
+        "output_dir": OUTPUT_DIR,
+        "public_base_url": PUBLIC_BASE_URL
+    }
+
 
 
 @app.post("/v1/documents", response_model=CreateDocumentResponse)
@@ -287,3 +293,4 @@ def download_document(file_id: str):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=f"{file_id}.docx",
     )
+
