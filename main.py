@@ -2,10 +2,12 @@ import base64
 import os
 import re
 import uuid
+import time
 from datetime import datetime
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from docx import Document
 from docx.shared import Pt
@@ -15,26 +17,34 @@ from docx.shared import Pt
 # CONFIGURACIÓN
 # ======================================================
 
-# Debe coincidir con la variable de entorno en Render: DOCGEN_API_TOKEN
 API_BEARER_TOKEN = os.getenv("DOCGEN_API_TOKEN", "sk-docgen-change-me")
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# >>> IMPORTANTE: esta variable DEBE llamarse "app" <<<
+# En Render tendrás una URL pública. La ponemos aquí para construir download_url correctamente.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# TTL en segundos para descargas (por defecto 24h)
+DOWNLOAD_TTL_SECONDS = int(os.getenv("DOWNLOAD_TTL_SECONDS", "86400"))
+
+# Registro en memoria (suficiente para prototipo). En producción: DB/Redis.
+# file_id -> {"path": str, "created_at": float}
+FILE_REGISTRY: Dict[str, Dict[str, object]] = {}
+
 app = FastAPI(
     title="Document Generator API",
-    version="1.0.0",
+    version="1.1.0",
     description="Generates DOCX documents for CVs and cover letters"
 )
 
 
 # ======================================================
-# MODELOS (Payload)
+# MODELOS
 # ======================================================
 
 DocumentType = Literal["cover_letter", "cv", "recruiter_scorecard"]
-FormatType = Literal["docx"]  # PDF se puede añadir después
+FormatType = Literal["docx"]
 
 
 class Candidate(BaseModel):
@@ -64,9 +74,12 @@ class CreateDocumentRequest(BaseModel):
 
 
 class CreateDocumentResponse(BaseModel):
+    file_id: str
     file_name: str
     content_type: str
-    file_base64: str
+    download_url: str
+    # Opcional: mantenemos base64 por si lo quieres aún (puedes quitarlo si no lo necesitas)
+    file_base64: Optional[str] = None
 
 
 # ======================================================
@@ -83,7 +96,7 @@ def verify_bearer_token(authorization: Optional[str]) -> None:
 
 
 # ======================================================
-# UTILIDADES DOCX
+# UTILIDADES
 # ======================================================
 
 def sanitize_filename(name: str) -> str:
@@ -94,12 +107,6 @@ def sanitize_filename(name: str) -> str:
 
 
 def add_text_with_basic_markdown(doc: Document, text: str) -> None:
-    """
-    Soporta markdown básico:
-    - '# '  → Heading 1
-    - '## ' → Heading 2
-    - '- '  → Bullet list
-    """
     lines = text.replace("\r\n", "\n").split("\n")
     bullet_buffer: List[str] = []
 
@@ -141,13 +148,29 @@ def add_text_with_basic_markdown(doc: Document, text: str) -> None:
     flush_bullets()
 
 
+def cleanup_expired_files() -> None:
+    """Borra ficheros expirados para no acumular basura (best-effort)."""
+    now = time.time()
+    to_delete = []
+    for file_id, meta in FILE_REGISTRY.items():
+        created_at = float(meta["created_at"])
+        if now - created_at > DOWNLOAD_TTL_SECONDS:
+            to_delete.append(file_id)
+
+    for file_id in to_delete:
+        path = str(FILE_REGISTRY[file_id]["path"])
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+        FILE_REGISTRY.pop(file_id, None)
+
+
 def build_docx(req: CreateDocumentRequest) -> str:
     doc = Document()
-
-    # Título
     doc.add_heading(req.title, level=1)
 
-    # Meta info
     meta = []
     if req.candidate and req.candidate.full_name:
         meta.append(req.candidate.full_name)
@@ -159,11 +182,8 @@ def build_docx(req: CreateDocumentRequest) -> str:
         run.font.size = Pt(9)
 
     doc.add_paragraph("")
-
-    # Contenido principal
     add_text_with_basic_markdown(doc, req.content.body_markdown)
 
-    # Secciones adicionales
     if req.content.sections:
         doc.add_page_break()
         doc.add_heading("Additional Sections", level=2)
@@ -172,41 +192,25 @@ def build_docx(req: CreateDocumentRequest) -> str:
                 doc.add_heading(section.heading, level=3)
             add_text_with_basic_markdown(doc, section.text)
 
-    # Guardar archivo
     safe_title = sanitize_filename(req.title)
-    file_id = uuid.uuid4().hex[:8]
+    file_id = uuid.uuid4().hex[:12]
     file_name = f"{safe_title}_{file_id}.docx"
     file_path = os.path.join(OUTPUT_DIR, file_name)
 
     doc.save(file_path)
-    return file_path
+    return file_id, file_name, file_path
+
+
+def require_public_base_url() -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    # Fallback: si no configuras PUBLIC_BASE_URL, construimos un link relativo.
+    # En la práctica, te recomiendo fijarlo en Render para que el GPT devuelva un link completo.
+    return ""
 
 
 # ======================================================
-# ENDPOINT PRINCIPAL
-# ======================================================
-
-@app.post("/v1/documents", response_model=CreateDocumentResponse)
-def create_document(
-    req: CreateDocumentRequest,
-    authorization: Optional[str] = Header(None)
-):
-    verify_bearer_token(authorization)
-
-    file_path = build_docx(req)
-
-    with open(file_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-
-    return CreateDocumentResponse(
-        file_name=os.path.basename(file_path),
-        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        file_base64=encoded
-    )
-
-
-# ======================================================
-# HEALTH CHECK
+# ENDPOINTS
 # ======================================================
 
 @app.get("/health")
@@ -214,3 +218,47 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/v1/documents", response_model=CreateDocumentResponse)
+def create_document(req: CreateDocumentRequest, authorization: Optional[str] = Header(None)):
+    verify_bearer_token(authorization)
+    cleanup_expired_files()
+
+    file_id, file_name, file_path = build_docx(req)
+
+    FILE_REGISTRY[file_id] = {"path": file_path, "created_at": time.time()}
+
+    base_url = require_public_base_url()
+    download_path = f"/v1/download/{file_id}"
+    download_url = f"{base_url}{download_path}" if base_url else download_path
+
+    # Si quieres NO devolver base64, pon include_base64=False y elimina este bloque.
+    with open(file_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+
+    return CreateDocumentResponse(
+        file_id=file_id,
+        file_name=file_name,
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        download_url=download_url,
+        file_base64=encoded
+    )
+
+
+@app.get("/v1/download/{file_id}")
+def download_document(file_id: str):
+    cleanup_expired_files()
+
+    meta = FILE_REGISTRY.get(file_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Suggest: regenerate the document (expired or unknown id).")
+
+    file_path = str(meta["path"])
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk (service restarted or expired).")
+
+    # Descarga como adjunto
+    return FileResponse(
+        path=file_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=os.path.basename(file_path),
+    )
