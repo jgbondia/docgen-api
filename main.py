@@ -4,7 +4,7 @@ import re
 import uuid
 import time
 from datetime import datetime
-from typing import Optional, List, Literal, Dict
+from typing import Optional, List, Literal, Dict, Tuple
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -14,33 +14,29 @@ from docx.shared import Pt
 
 
 # ======================================================
-# CONFIGURACIÓN
+# CONFIG
 # ======================================================
 
 API_BEARER_TOKEN = os.getenv("DOCGEN_API_TOKEN", "sk-docgen-change-me")
 
-OUTPUT_DIR = "output"
+# IMPORTANTE: usa /tmp en Render (siempre writable)
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/tmp/docgen_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# En Render tendrás una URL pública. La ponemos aquí para construir download_url correctamente.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-
-# TTL en segundos para descargas (por defecto 24h)
 DOWNLOAD_TTL_SECONDS = int(os.getenv("DOWNLOAD_TTL_SECONDS", "86400"))
 
-# Registro en memoria (suficiente para prototipo). En producción: DB/Redis.
-# file_id -> {"path": str, "created_at": float}
+# registry en memoria (best-effort)
 FILE_REGISTRY: Dict[str, Dict[str, object]] = {}
 
 app = FastAPI(
     title="Document Generator API",
-    version="1.1.0",
-    description="Generates DOCX documents for CVs and cover letters"
+    version="1.2.0",
+    description="Generates DOCX documents for CVs, cover letters and recruiter scorecards"
 )
 
-
 # ======================================================
-# MODELOS
+# MODELS
 # ======================================================
 
 DocumentType = Literal["cover_letter", "cv", "recruiter_scorecard"]
@@ -60,7 +56,7 @@ class Section(BaseModel):
 
 
 class Content(BaseModel):
-    body_markdown: str = Field(..., description="Contenido principal en texto o markdown simple")
+    body_markdown: str = Field(..., description="Main content in text/markdown")
     sections: Optional[List[Section]] = None
 
 
@@ -78,12 +74,12 @@ class CreateDocumentResponse(BaseModel):
     file_name: str
     content_type: str
     download_url: str
-    # Opcional: mantenemos base64 por si lo quieres aún (puedes quitarlo si no lo necesitas)
+    download_markdown: str
     file_base64: Optional[str] = None
 
 
 # ======================================================
-# AUTENTICACIÓN
+# AUTH
 # ======================================================
 
 def verify_bearer_token(authorization: Optional[str]) -> None:
@@ -96,7 +92,7 @@ def verify_bearer_token(authorization: Optional[str]) -> None:
 
 
 # ======================================================
-# UTILIDADES
+# UTILS
 # ======================================================
 
 def sanitize_filename(name: str) -> str:
@@ -149,25 +145,45 @@ def add_text_with_basic_markdown(doc: Document, text: str) -> None:
 
 
 def cleanup_expired_files() -> None:
-    """Borra ficheros expirados para no acumular basura (best-effort)."""
     now = time.time()
+
+    # 1) limpieza del registry
     to_delete = []
-    for file_id, meta in FILE_REGISTRY.items():
+    for file_id, meta in list(FILE_REGISTRY.items()):
         created_at = float(meta["created_at"])
         if now - created_at > DOWNLOAD_TTL_SECONDS:
             to_delete.append(file_id)
 
     for file_id in to_delete:
-        path = str(FILE_REGISTRY[file_id]["path"])
         try:
+            path = str(FILE_REGISTRY[file_id]["path"])
             if os.path.exists(path):
                 os.remove(path)
         except Exception:
             pass
         FILE_REGISTRY.pop(file_id, None)
 
+    # 2) limpieza best-effort del disco por mtime (si registry se perdió)
+    try:
+        for fn in os.listdir(OUTPUT_DIR):
+            if not fn.endswith(".docx"):
+                continue
+            full = os.path.join(OUTPUT_DIR, fn)
+            try:
+                mtime = os.path.getmtime(full)
+                if now - mtime > DOWNLOAD_TTL_SECONDS:
+                    os.remove(full)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-def build_docx(req: CreateDocumentRequest) -> str:
+
+def require_public_base_url() -> str:
+    return PUBLIC_BASE_URL
+
+
+def build_docx(req: CreateDocumentRequest) -> Tuple[str, str, str]:
     doc = Document()
     doc.add_heading(req.title, level=1)
 
@@ -192,21 +208,32 @@ def build_docx(req: CreateDocumentRequest) -> str:
                 doc.add_heading(section.heading, level=3)
             add_text_with_basic_markdown(doc, section.text)
 
+    # file_id determinista
+    file_id = uuid.uuid4().hex
     safe_title = sanitize_filename(req.title)
-    file_id = uuid.uuid4().hex[:12]
-    file_name = f"{safe_title}_{file_id}.docx"
-    file_path = os.path.join(OUTPUT_DIR, file_name)
+    file_name = f"{safe_title}_{file_id[:12]}.docx"
+
+    # path determinista por file_id: permite descargar aunque el registry se pierda
+    file_path = os.path.join(OUTPUT_DIR, f"{file_id}.docx")
 
     doc.save(file_path)
     return file_id, file_name, file_path
 
 
-def require_public_base_url() -> str:
-    if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL
-    # Fallback: si no configuras PUBLIC_BASE_URL, construimos un link relativo.
-    # En la práctica, te recomiendo fijarlo en Render para que el GPT devuelva un link completo.
-    return ""
+def resolve_file_path(file_id: str) -> Optional[str]:
+    # 1) si está en registry
+    meta = FILE_REGISTRY.get(file_id)
+    if meta:
+        p = str(meta["path"])
+        if os.path.exists(p):
+            return p
+
+    # 2) path determinista
+    deterministic = os.path.join(OUTPUT_DIR, f"{file_id}.docx")
+    if os.path.exists(deterministic):
+        return deterministic
+
+    return None
 
 
 # ======================================================
@@ -231,7 +258,9 @@ def create_document(req: CreateDocumentRequest, authorization: Optional[str] = H
     download_path = f"/v1/download/{file_id}"
     download_url = f"{base_url}{download_path}" if base_url else download_path
 
-    # Si quieres NO devolver base64, pon include_base64=False y elimina este bloque.
+    download_markdown = f"[Download DOCX]({download_url})"
+
+    # base64 fallback opcional
     with open(file_path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("utf-8")
 
@@ -240,6 +269,7 @@ def create_document(req: CreateDocumentRequest, authorization: Optional[str] = H
         file_name=file_name,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         download_url=download_url,
+        download_markdown=download_markdown,
         file_base64=encoded
     )
 
@@ -248,17 +278,12 @@ def create_document(req: CreateDocumentRequest, authorization: Optional[str] = H
 def download_document(file_id: str):
     cleanup_expired_files()
 
-    meta = FILE_REGISTRY.get(file_id)
-    if not meta:
+    file_path = resolve_file_path(file_id)
+    if not file_path:
         raise HTTPException(status_code=404, detail="Suggest: regenerate the document (expired or unknown id).")
 
-    file_path = str(meta["path"])
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk (service restarted or expired).")
-
-    # Descarga como adjunto
     return FileResponse(
         path=file_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=os.path.basename(file_path),
+        filename=f"{file_id}.docx",
     )
