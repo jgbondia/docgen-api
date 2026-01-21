@@ -280,17 +280,28 @@ def create_document(req: CreateDocumentRequest, authorization: Optional[str] = H
     )
 
 
+from glob import glob
+
 @app.get("/v1/download/{file_id}")
 def download_document(file_id: str):
     cleanup_expired_files()
 
-    file_path = resolve_file_path(file_id)
-    if not file_path:
+    # Busca el archivo aunque el proceso se haya reiniciado
+    pattern = os.path.join(OUTPUT_DIR, f"*_{file_id}.docx")
+    matches = glob(pattern)
+
+    if not matches:
         raise HTTPException(status_code=404, detail="Suggest: regenerate the document (expired or unknown id).")
+
+    file_path = matches[0]
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk.")
 
     return FileResponse(
         path=file_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=f"{file_id}.docx",
+        filename=os.path.basename(file_path),
     )
+
+
 
