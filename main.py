@@ -233,69 +233,14 @@ def resolve_file_path(file_id: str) -> Optional[str]:
 # ENDPOINTS
 # ======================================================
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "api_version": "1.2.0",
-        "output_dir": OUTPUT_DIR,
-        "public_base_url": PUBLIC_BASE_URL
-    }
-
-
-
-@app.post("/v1/documents", response_model=CreateDocumentResponse)
+@app.post("/v1/documents")
 def create_document(req: CreateDocumentRequest, authorization: Optional[str] = Header(None)):
     verify_bearer_token(authorization)
-    cleanup_expired_files()
 
     file_id, file_name, file_path = build_docx(req)
-
-    FILE_REGISTRY[file_id] = {"path": file_path, "created_at": time.time()}
-
-    base_url = require_public_base_url()
-    download_path = f"/v1/download/{file_id}"
-    download_url = f"{base_url}{download_path}" if base_url else download_path
-
-    download_markdown = f"[Download DOCX]({download_url})"
-
-    # base64 fallback opcional
-    with open(file_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-
-    return CreateDocumentResponse(
-        file_id=file_id,
-        file_name=file_name,
-        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        download_url=download_url,
-        download_markdown=download_markdown,
-        file_base64=encoded
-    )
-
-
-from glob import glob
-
-@app.get("/v1/download/{file_id}")
-def download_document(file_id: str):
-    cleanup_expired_files()
-
-    # Busca el archivo aunque el proceso se haya reiniciado
-    pattern = os.path.join(OUTPUT_DIR, f"*_{file_id}.docx")
-    matches = glob(pattern)
-
-    if not matches:
-        raise HTTPException(status_code=404, detail="Suggest: regenerate the document (expired or unknown id).")
-
-    file_path = matches[0]
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk.")
 
     return FileResponse(
         path=file_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=os.path.basename(file_path),
+        filename=file_name
     )
-
-
-
-
