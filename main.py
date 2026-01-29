@@ -5,30 +5,31 @@ import uuid
 import time
 from datetime import datetime
 from glob import glob
-from typing import Optional, List, Literal, Dict, Tuple
+from typing import Optional, List, Literal, Tuple
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from docx import Document
 from docx.shared import Pt
 
 # ======================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN ROBUSTA (Hardcoded para evitar errores de ENV)
 # ======================================================
 API_BEARER_TOKEN = os.getenv("DOCGEN_API_TOKEN", "sk-docgen-change-me")
-# Usamos /tmp porque en Render Free es el único sitio escribible garantizado
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/tmp/docgen_output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# EN RENDER SIEMPRE USAR /tmp
+OUTPUT_DIR = "/tmp/docgen_output"
+# Aseguramos que existe al arrancar
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except Exception as e:
+    print(f"Error creating dir: {e}")
+
+# URL pública para construir links absolutos
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-DOWNLOAD_TTL_SECONDS = int(os.getenv("DOWNLOAD_TTL_SECONDS", "86400"))
 
-app = FastAPI(
-    title="Document Generator API",
-    version="1.3.0",
-    description="Generates DOCX documents with robust persistence fix"
-)
+app = FastAPI(title="Document Generator API - Debug Version")
 
 # ======================================================
 # MODELOS
@@ -64,7 +65,6 @@ class CreateDocumentResponse(BaseModel):
     content_type: str
     download_url: str
     download_markdown: str
-    file_base64: Optional[str] = None
 
 # ======================================================
 # UTILIDADES
@@ -77,68 +77,39 @@ def verify_bearer_token(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def sanitize_filename(name: str) -> str:
-    name = name.strip()
+    name = str(name).strip()
     name = re.sub(r"[^\w\-\. ]+", "", name, flags=re.UNICODE)
     name = re.sub(r"\s+", "_", name)
-    return name[:50]  # Limitamos longitud para evitar problemas de filesystem
+    return name[:50]
 
 def add_text_with_basic_markdown(doc: Document, text: str) -> None:
+    if not text: return
     lines = text.replace("\r\n", "\n").split("\n")
-    bullet_buffer = []
-
-    def flush_bullets():
-        nonlocal bullet_buffer
-        for bullet in bullet_buffer:
-            p = doc.add_paragraph(bullet, style="List Bullet")
-            for run in p.runs: run.font.size = Pt(11)
-        bullet_buffer = []
-
     for line in lines:
-        line = line.rstrip()
-        if not line.strip():
-            flush_bullets()
+        line = line.strip()
+        if not line:
             doc.add_paragraph("")
             continue
-        if line.startswith("## "):
-            flush_bullets()
-            doc.add_heading(line[3:], level=2)
-            continue
         if line.startswith("# "):
-            flush_bullets()
             doc.add_heading(line[2:], level=1)
-            continue
-        if line.startswith("- ") or line.startswith("* "):
-            bullet_buffer.append(line[2:])
-            continue
-        
-        flush_bullets()
-        p = doc.add_paragraph(line)
-        for run in p.runs: run.font.size = Pt(11)
-    flush_bullets()
-
-def cleanup_expired_files() -> None:
-    """Borra ficheros antiguos del disco"""
-    now = time.time()
-    # Busca todos los .docx en la carpeta
-    for p in glob(os.path.join(OUTPUT_DIR, "*.docx")):
-        try:
-            if now - os.path.getmtime(p) > DOWNLOAD_TTL_SECONDS:
-                os.remove(p)
-        except Exception:
-            pass
+        elif line.startswith("## "):
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith("- ") or line.startswith("* "):
+            p = doc.add_paragraph(line[2:], style="List Bullet")
+        else:
+            doc.add_paragraph(line)
 
 def build_docx(req: CreateDocumentRequest) -> Tuple[str, str, str]:
     doc = Document()
     doc.add_heading(req.title, level=1)
     
     # Metadata
-    meta = []
-    if req.candidate and req.candidate.full_name:
-        meta.append(req.candidate.full_name)
-    meta.append(datetime.now().strftime("%Y-%m-%d"))
-    p = doc.add_paragraph(" | ".join(meta))
-    for run in p.runs: run.font.size = Pt(9)
-    doc.add_paragraph("")
+    if req.candidate:
+        meta = f"Candidate: {req.candidate.full_name or 'N/A'} | Date: {datetime.now().strftime('%Y-%m-%d')}"
+        p = doc.add_paragraph(meta)
+        p.italic = True
+    
+    doc.add_paragraph("") # Spacer
 
     # Body
     add_text_with_basic_markdown(doc, req.content.body_markdown)
@@ -151,11 +122,14 @@ def build_docx(req: CreateDocumentRequest) -> Tuple[str, str, str]:
                 doc.add_heading(section.heading, level=2)
             add_text_with_basic_markdown(doc, section.text)
 
-    # --- CORRECCIÓN CLAVE ---
+    # Guardado seguro
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    except:
+        pass
+
     file_id = uuid.uuid4().hex
-    safe_title = sanitize_filename(req.title)
-    
-    # El nombre en disco AHORA incluye el título y el ID, coincidiendo con el patrón de búsqueda
+    safe_title = sanitize_filename(req.title) or "document"
     file_name_on_disk = f"{safe_title}_{file_id}.docx"
     file_path = os.path.join(OUTPUT_DIR, file_name_on_disk)
     
@@ -165,57 +139,74 @@ def build_docx(req: CreateDocumentRequest) -> Tuple[str, str, str]:
 # ======================================================
 # ENDPOINTS
 # ======================================================
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.3.0", "storage": OUTPUT_DIR}
+    # Comprobación de escritura en disco para debug
+    try:
+        test_file = os.path.join(OUTPUT_DIR, "write_test.txt")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        write_status = "writable"
+    except Exception as e:
+        write_status = f"error: {str(e)}"
+        
+    return {
+        "status": "ok", 
+        "version": "1.4.0-debug", 
+        "output_dir": OUTPUT_DIR,
+        "disk_status": write_status
+    }
 
 @app.post("/v1/documents", response_model=CreateDocumentResponse)
 def create_document(req: CreateDocumentRequest, authorization: Optional[str] = Header(None)):
     verify_bearer_token(authorization)
-    cleanup_expired_files()
     
-    file_id, file_name, file_path = build_docx(req)
-    
-    # Construcción URL
-    base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else ""
-    download_url = f"{base_url}/v1/download/{file_id}"
-    download_markdown = f"[Download DOCX]({download_url})"
+    try:
+        file_id, file_name, file_path = build_docx(req)
+        
+        base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else "https://docgen-api-o3tq.onrender.com"
+        download_url = f"{base_url}/v1/download/{file_id}"
+        download_markdown = f"[Descargar DOCX]({download_url})"
 
-    # Base64 opcional por si acaso
-    with open(file_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-
-    return CreateDocumentResponse(
-        file_id=file_id,
-        file_name=file_name,
-        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        download_url=download_url,
-        download_markdown=download_markdown,
-        file_base64=encoded
-    )
+        return CreateDocumentResponse(
+            file_id=file_id,
+            file_name=file_name,
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            download_url=download_url,
+            download_markdown=download_markdown
+        )
+    except Exception as e:
+        # Devolver error visible en lugar de 500 generico
+        raise HTTPException(status_code=500, detail=f"Error generating doc: {str(e)}")
 
 @app.get("/v1/download/{file_id}")
 def download_document(file_id: str):
-    cleanup_expired_files()
-    
-    # --- BÚSQUEDA ROBUSTA ---
-    # Buscamos cualquier archivo que termine en _{file_id}.docx
-    # Esto encuentra el archivo aunque el servidor se haya reiniciado
-    pattern = os.path.join(OUTPUT_DIR, f"*_{file_id}.docx")
-    matches = glob(pattern)
-    
-    if not matches:
-        # Fallback: intentar buscar solo por ID si el patrón complejo falla
-        direct_path = os.path.join(OUTPUT_DIR, f"{file_id}.docx")
-        if os.path.exists(direct_path):
-            matches = [direct_path]
-        else:
-            raise HTTPException(status_code=404, detail="File not found (expired or unknown ID). Please regenerate.")
-    
-    file_path = matches
-    
-    return FileResponse(
-        path=file_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=os.path.basename(file_path)
-    )
+    try:
+        # Búsqueda segura
+        pattern = os.path.join(OUTPUT_DIR, f"*_{file_id}.docx")
+        matches = glob(pattern)
+        
+        # Fallback: buscar solo por ID si el patrón complejo falla
+        if not matches:
+             matches = glob(os.path.join(OUTPUT_DIR, f"{file_id}.docx"))
+
+        if not matches:
+            # Listar archivos disponibles para debug (solo veras esto si falla)
+            available = os.listdir(OUTPUT_DIR)
+            raise HTTPException(status_code=404, detail=f"File not found. ID: {file_id}. Available in {OUTPUT_DIR}: {len(available)} files.")
+        
+        file_path = matches
+        return FileResponse(
+            path=file_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=os.path.basename(file_path)
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        # Capturamos el error 500 y te decimos qué es
+        return JSONResponse(
+            status_code=500, 
+            content={"error": "Internal Server Error", "details": str(e), "type": type(e).__name__}
+        )
