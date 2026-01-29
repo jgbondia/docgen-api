@@ -194,7 +194,8 @@ def health():
         "status": "ok", 
         "version": "1.3.0", 
         "engine": "glob-fix",
-        "output_dir": OUTPUT_DIR
+        "output_dir": OUTPUT_DIR,
+        "public_base_url": PUBLIC_BASE_URL
     }
 
 @app.post("/v1/documents", response_model=CreateDocumentResponse)
