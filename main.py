@@ -4,7 +4,8 @@ import re
 import uuid
 import time
 from datetime import datetime
-from typing import Optional, List, Literal, Dict, Tuple
+from glob import glob
+from typing import Optional, List, Literal, Dict
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -12,36 +13,33 @@ from pydantic import BaseModel, Field
 from docx import Document
 from docx.shared import Pt
 
-
 # ======================================================
-# CONFIG
+# CONFIGURACIÓN
 # ======================================================
-
+# Token de seguridad (debe coincidir con Render y GPT Action)
 API_BEARER_TOKEN = os.getenv("DOCGEN_API_TOKEN", "sk-docgen-change-me")
 
-# IMPORTANTE: usa /tmp en Render (siempre writable)
+# Directorio temporal (en Render /tmp siempre es escribible)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/tmp/docgen_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# URL pública para construir links absolutos
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-DOWNLOAD_TTL_SECONDS = int(os.getenv("DOWNLOAD_TTL_SECONDS", "86400"))
 
-# registry en memoria (best-effort)
-FILE_REGISTRY: Dict[str, Dict[str, object]] = {}
+# Tiempo de vida de los archivos (24h por defecto)
+DOWNLOAD_TTL_SECONDS = int(os.getenv("DOWNLOAD_TTL_SECONDS", "86400"))
 
 app = FastAPI(
     title="Document Generator API",
-    version="1.2.0",
-    description="Generates DOCX documents for CVs, cover letters and recruiter scorecards"
+    version="1.3.0",
+    description="Generates DOCX documents for CVs, cover letters and scorecards"
 )
 
 # ======================================================
-# MODELS
+# MODELOS DE DATOS (Pydantic)
 # ======================================================
-
 DocumentType = Literal["cover_letter", "cv", "recruiter_scorecard"]
 FormatType = Literal["docx"]
-
 
 class Candidate(BaseModel):
     full_name: Optional[str] = None
@@ -49,16 +47,13 @@ class Candidate(BaseModel):
     phone: Optional[str] = None
     location: Optional[str] = None
 
-
 class Section(BaseModel):
     heading: Optional[str] = None
     text: str
 
-
 class Content(BaseModel):
-    body_markdown: str = Field(..., description="Main content in text/markdown")
+    body_markdown: str = Field(..., description="Contenido principal en Markdown o texto")
     sections: Optional[List[Section]] = None
-
 
 class CreateDocumentRequest(BaseModel):
     document_type: DocumentType
@@ -68,41 +63,34 @@ class CreateDocumentRequest(BaseModel):
     candidate: Optional[Candidate] = None
     content: Content
 
-
 class CreateDocumentResponse(BaseModel):
     file_id: str
     file_name: str
     content_type: str
     download_url: str
     download_markdown: str
-    file_base64: Optional[str] = None
-
 
 # ======================================================
-# AUTH
+# SEGURIDAD
 # ======================================================
-
 def verify_bearer_token(authorization: Optional[str]) -> None:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
-
     expected = f"Bearer {API_BEARER_TOKEN}"
     if authorization.strip() != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-
 # ======================================================
-# UTILS
+# UTILIDADES (DOCX + Archivos)
 # ======================================================
-
 def sanitize_filename(name: str) -> str:
     name = name.strip()
     name = re.sub(r"[^\w\-\. ]+", "", name, flags=re.UNICODE)
     name = re.sub(r"\s+", "_", name)
     return name[:120]
 
-
 def add_text_with_basic_markdown(doc: Document, text: str) -> None:
+    """Convierte Markdown básico (#, ##, -) a formato Word."""
     lines = text.replace("\r\n", "\n").split("\n")
     bullet_buffer: List[str] = []
 
@@ -116,37 +104,38 @@ def add_text_with_basic_markdown(doc: Document, text: str) -> None:
 
     for line in lines:
         line = line.rstrip()
-
         if not line.strip():
             flush_bullets()
             doc.add_paragraph("")
             continue
-
+        
+        # Detectar Títulos
         if line.startswith("## "):
             flush_bullets()
             doc.add_heading(line[3:], level=2)
             continue
-
         if line.startswith("# "):
             flush_bullets()
             doc.add_heading(line[2:], level=1)
             continue
-
-        if line.startswith("- "):
+        
+        # Detectar Listas
+        if line.startswith("- ") or line.startswith("* "):
             bullet_buffer.append(line[2:])
             continue
-
+        
+        # Texto normal
         flush_bullets()
         p = doc.add_paragraph(line)
         for run in p.runs:
             run.font.size = Pt(11)
-
+    
     flush_bullets()
 
-
 def cleanup_expired_files() -> None:
-    """Borra ficheros DOCX expirados en OUTPUT_DIR para no acumular basura."""
+    """Borra ficheros antiguos buscando directamente en disco."""
     now = time.time()
+    # Busca todos los .docx en la carpeta de salida
     for p in glob(os.path.join(OUTPUT_DIR, "*.docx")):
         try:
             age = now - os.path.getmtime(p)
@@ -155,92 +144,103 @@ def cleanup_expired_files() -> None:
         except Exception:
             pass
 
-
-    # 2) limpieza best-effort del disco por mtime (si registry se perdió)
-    try:
-        for fn in os.listdir(OUTPUT_DIR):
-            if not fn.endswith(".docx"):
-                continue
-            full = os.path.join(OUTPUT_DIR, fn)
-            try:
-                mtime = os.path.getmtime(full)
-                if now - mtime > DOWNLOAD_TTL_SECONDS:
-                    os.remove(full)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def require_public_base_url() -> str:
-    return PUBLIC_BASE_URL
-
-
-def build_docx(req: CreateDocumentRequest) -> Tuple[str, str, str]:
+def build_docx(req: CreateDocumentRequest) -> str:
     doc = Document()
+    
+    # 1. Título y Metadatos
     doc.add_heading(req.title, level=1)
-
     meta = []
     if req.candidate and req.candidate.full_name:
         meta.append(req.candidate.full_name)
     meta.append(datetime.now().strftime("%Y-%m-%d"))
     meta.append(f"Language: {req.language}")
-
+    
     p = doc.add_paragraph(" | ".join(meta))
     for run in p.runs:
         run.font.size = Pt(9)
+        run.italic = True
+    doc.add_paragraph("") # Espacio
 
-    doc.add_paragraph("")
+    # 2. Contenido Principal
     add_text_with_basic_markdown(doc, req.content.body_markdown)
 
+    # 3. Secciones Extra (Tablas simuladas, preguntas, etc.)
     if req.content.sections:
         doc.add_page_break()
-        doc.add_heading("Additional Sections", level=2)
         for section in req.content.sections:
             if section.heading:
-                doc.add_heading(section.heading, level=3)
+                doc.add_heading(section.heading, level=2)
             add_text_with_basic_markdown(doc, section.text)
 
-    # file_id determinista
-    file_id = uuid.uuid4().hex
+    # 4. Guardar archivo
     safe_title = sanitize_filename(req.title)
-    file_name = f"{safe_title}_{file_id[:12]}.docx"
-
-    # path determinista por file_id: permite descargar aunque el registry se pierda
-    file_path = os.path.join(OUTPUT_DIR, f"{file_id}.docx")
-
+    file_id = uuid.uuid4().hex
+    # El nombre incluye el ID para poder buscarlo con glob después
+    file_name = f"{safe_title}_{file_id}.docx"
+    file_path = os.path.join(OUTPUT_DIR, file_name)
+    
     doc.save(file_path)
     return file_id, file_name, file_path
-
-
-def resolve_file_path(file_id: str) -> Optional[str]:
-    # 1) si está en registry
-    meta = FILE_REGISTRY.get(file_id)
-    if meta:
-        p = str(meta["path"])
-        if os.path.exists(p):
-            return p
-
-    # 2) path determinista
-    deterministic = os.path.join(OUTPUT_DIR, f"{file_id}.docx")
-    if os.path.exists(deterministic):
-        return deterministic
-
-    return None
-
 
 # ======================================================
 # ENDPOINTS
 # ======================================================
 
-@app.post("/v1/documents")
+@app.get("/health")
+def health():
+    return {
+        "status": "ok", 
+        "version": "1.3.0", 
+        "engine": "glob-fix",
+        "output_dir": OUTPUT_DIR
+    }
+
+@app.post("/v1/documents", response_model=CreateDocumentResponse)
 def create_document(req: CreateDocumentRequest, authorization: Optional[str] = Header(None)):
     verify_bearer_token(authorization)
-
+    cleanup_expired_files() # Limpieza preventiva
+    
+    # Generar DOCX
     file_id, file_name, file_path = build_docx(req)
+    
+    # Construir URL
+    base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else ""
+    download_path = f"/v1/download/{file_id}"
+    download_url = f"{base_url}{download_path}"
+    
+    # Markdown listo para el GPT
+    download_markdown = f"[Descargar DOCX]({download_url})"
+
+    return CreateDocumentResponse(
+        file_id=file_id,
+        file_name=file_name,
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        download_url=download_url,
+        download_markdown=download_markdown
+    )
+
+@app.get("/v1/download/{file_id}")
+def download_document(file_id: str):
+    """
+    Busca el archivo en disco usando glob. 
+    Esto arregla el error 'unknown id' si el servidor se reinicia.
+    """
+    cleanup_expired_files()
+    
+    # Patrón de búsqueda: cualquier nombre que termine en _{file_id}.docx
+    pattern = os.path.join(OUTPUT_DIR, f"*_{file_id}.docx")
+    matches = glob(pattern)
+    
+    if not matches:
+        raise HTTPException(status_code=404, detail="File not found (expired or invalid ID).")
+    
+    file_path = matches
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File lost from disk.")
 
     return FileResponse(
         path=file_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=file_name
+        filename=os.path.basename(file_path)
     )
